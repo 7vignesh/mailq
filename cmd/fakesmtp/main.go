@@ -22,7 +22,11 @@ func main() {
 	flag.Parse()
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil)).With("component", "fakesmtp")
 
-	opts := fakesmtp.Options{Addr: *addr, SlowDelay: *slow}
+	opts := fakesmtp.Options{Addr: *addr, SlowDelay: *slow, OnReceive: func(r fakesmtp.Received) {
+		// Logged when the body arrives, before replying: for slow@ and
+		// dropafter@ the client may never learn this message got here.
+		log.Info("received", "from", r.From, "to", r.To, "bytes", len(r.Data), "tls", r.TLS)
+	}}
 	if *useTLS {
 		cfg, err := fakesmtp.SelfSignedTLS()
 		if err != nil {
@@ -41,8 +45,5 @@ func main() {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt)
 	<-sig
-	for _, r := range s.Received() {
-		log.Info("received", "from", r.From, "to", r.To, "bytes", len(r.Data), "tls", r.TLS, "replied", r.Replied)
-	}
 	s.Close()
 }

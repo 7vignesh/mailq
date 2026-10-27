@@ -47,11 +47,12 @@ func init() {
 }
 
 type Options struct {
-	Addr         string        // listen address, default 127.0.0.1:0
-	Hostname     string        // used in the greeting, default fake.mailq.test
-	TLS          *tls.Config   // if set, STARTTLS is advertised
-	SplitReplies bool          // write replies a few bytes at a time to exercise client buffering
-	SlowDelay    time.Duration // for SlowAccept, default 2s
+	Addr         string         // listen address, default 127.0.0.1:0
+	Hostname     string         // used in the greeting, default fake.mailq.test
+	TLS          *tls.Config    // if set, STARTTLS is advertised
+	SplitReplies bool           // write replies a few bytes at a time to exercise client buffering
+	SlowDelay    time.Duration  // for SlowAccept, default 2s
+	OnReceive    func(Received) // called when a message is read in full, before any reply
 }
 
 // Received is a message the server read in full.
@@ -379,8 +380,11 @@ func (ss *session) handleData() bool {
 
 func (ss *session) record(r Received) {
 	ss.srv.mu.Lock()
-	defer ss.srv.mu.Unlock()
 	ss.srv.received = append(ss.srv.received, r)
+	ss.srv.mu.Unlock()
+	if f := ss.srv.opts.OnReceive; f != nil {
+		f(r)
+	}
 }
 
 // extractPath turns "FROM:<a@b> SIZE=10" into "a@b".
