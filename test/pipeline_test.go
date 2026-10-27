@@ -16,6 +16,8 @@ func TestPipelineOutcomes(t *testing.T) {
 	h := newHarness(t, fakesmtp.Options{})
 	h.startWorker(h.defaultWorker("w1"))
 
+	// Each behavior gets its own domain: the 421 slows its whole domain
+	// down, which would otherwise stall every other row in this table.
 	tests := []struct {
 		rcpt     string
 		state    store.State
@@ -25,15 +27,15 @@ func TestPipelineOutcomes(t *testing.T) {
 		reason   string
 		stage    string
 	}{
-		{"accept@a.test", store.StateDelivered, 250, "2.0.0", "delivered", "", "data_end"},
-		{"throttle@a.test", store.StateDeferred, 421, "4.7.0", "transient", "throttled", "rcpt"},
-		{"busy@a.test", store.StateDeferred, 450, "4.2.1", "transient", "mailbox_busy", "rcpt"},
-		{"greylist@a.test", store.StateDeferred, 451, "4.7.1", "transient", "greylisted", "rcpt"},
-		{"full@a.test", store.StateDeferred, 452, "4.2.2", "transient", "mailbox_full", "rcpt"},
-		{"nouser@a.test", store.StateBounced, 550, "5.1.1", "permanent", "no_such_user", "rcpt"},
-		{"policy@a.test", store.StateBounced, 554, "5.7.1", "permanent", "policy_blocked", "data_end"},
-		{"hang@a.test", store.StateDeferred, 0, "", "transient", "timeout", "rcpt"},
-		{"drop@a.test", store.StateDeferred, 0, "", "transient", "connection_failure", "data_end"},
+		{"accept@accept.test", store.StateDelivered, 250, "2.0.0", "delivered", "", "data_end"},
+		{"throttle@throttle.test", store.StateDeferred, 421, "4.7.0", "transient", "throttled", "rcpt"},
+		{"busy@busy.test", store.StateDeferred, 450, "4.2.1", "transient", "mailbox_busy", "rcpt"},
+		{"greylist@greylist.test", store.StateDeferred, 451, "4.7.1", "transient", "greylisted", "rcpt"},
+		{"full@full.test", store.StateDeferred, 452, "4.2.2", "transient", "mailbox_full", "rcpt"},
+		{"nouser@nouser.test", store.StateBounced, 550, "5.1.1", "permanent", "no_such_user", "rcpt"},
+		{"policy@policy.test", store.StateBounced, 554, "5.7.1", "permanent", "policy_blocked", "data_end"},
+		{"hang@hang.test", store.StateDeferred, 0, "", "transient", "timeout", "rcpt"},
+		{"drop@drop.test", store.StateDeferred, 0, "", "transient", "connection_failure", "data_end"},
 	}
 	ids := map[string]string{}
 	for _, tt := range tests {
@@ -41,7 +43,7 @@ func TestPipelineOutcomes(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.rcpt, func(t *testing.T) {
-			m, attempts := h.waitFor(ids[tt.rcpt], 1, tt.state)
+			m, attempts := h.with(t).waitFor(ids[tt.rcpt], 1, tt.state)
 			if len(attempts) != 1 || m.AttemptCount != 1 {
 				t.Fatalf("attempts = %d (count %d), want 1", len(attempts), m.AttemptCount)
 			}
@@ -197,7 +199,7 @@ func TestTwoWorkersDeliverEachMessageOnce(t *testing.T) {
 func TestCrashedWorkerLeaseIsReaped(t *testing.T) {
 	h := newHarness(t, fakesmtp.Options{})
 	id := h.send("accept@a.test")
-	claimed, err := h.st.Claim(context.Background(), "dead-worker", h.clk.Now())
+	claimed, err := h.st.Claim(context.Background(), "dead-worker", h.clk.Now(), nil)
 	if err != nil || claimed == nil || claimed.ID != id {
 		t.Fatalf("claim: %v %v", claimed, err)
 	}

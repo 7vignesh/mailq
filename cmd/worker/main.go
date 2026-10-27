@@ -18,6 +18,7 @@ import (
 	"github.com/7vignesh/mailq/internal/env"
 	"github.com/7vignesh/mailq/internal/smtp"
 	"github.com/7vignesh/mailq/internal/store"
+	"github.com/7vignesh/mailq/internal/throttle"
 	"github.com/7vignesh/mailq/internal/worker"
 )
 
@@ -35,7 +36,7 @@ func run(log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	cfg, client, bo, err := load()
+	cfg, client, bo, tc, err := load()
 	if err != nil {
 		return err
 	}
@@ -47,7 +48,10 @@ func run(log *slog.Logger) error {
 	if err := st.Migrate(ctx); err != nil {
 		return err
 	}
-	w, err := worker.New(cfg, st, client, bo, clock.Real{}, log)
+	clk := clock.Real{}
+	w, err := worker.New(cfg, worker.Deps{
+		Store: st, Client: client, Backoff: bo, Limiter: throttle.New(tc, clk), Clock: clk, Log: log,
+	})
 	if err != nil {
 		return err
 	}
@@ -57,7 +61,7 @@ func run(log *slog.Logger) error {
 	return nil
 }
 
-func load() (worker.Config, *smtp.Client, backoff.Policy, error) {
+func load() (worker.Config, *smtp.Client, backoff.Policy, throttle.Config, error) {
 	var errs []error
 	intv := func(k string, d int) int { v, err := env.Int(k, d); errs = append(errs, err); return v }
 	dur := func(k string, d time.Duration) time.Duration {
@@ -65,6 +69,7 @@ func load() (worker.Config, *smtp.Client, backoff.Policy, error) {
 		errs = append(errs, err)
 		return v
 	}
+	floatv := func(k string, d float64) float64 { return float64(intv(k, int(d))) }
 	boolv := func(k string, d bool) bool { v, err := env.Bool(k, d); errs = append(errs, err); return v }
 
 	host, _ := os.Hostname()
@@ -104,12 +109,19 @@ func load() (worker.Config, *smtp.Client, backoff.Policy, error) {
 	bo.Max = dur("MAILQ_RETRY_MAX", bo.Max)
 	bo.MaxAge = dur("MAILQ_MAX_AGE", bo.MaxAge)
 
+	tc := throttle.DefaultConfig()
+	tc.MaxConcurrent = intv("MAILQ_DOMAIN_MAX_CONNS", tc.MaxConcurrent)
+	tc.InitialRate = floatv("MAILQ_DOMAIN_INITIAL_RATE", tc.InitialRate)
+	tc.MinRate = floatv("MAILQ_DOMAIN_MIN_RATE", tc.MinRate)
+	tc.MaxRate = floatv("MAILQ_DOMAIN_MAX_RATE", tc.MaxRate)
+	errs = append(errs, tc.Validate())
+
 	for _, err := range errs {
 		if err != nil {
-			return cfg, nil, bo, err
+			return cfg, nil, bo, tc, err
 		}
 	}
-	return cfg, client, bo, nil
+	return cfg, client, bo, tc, nil
 }
 
 func randHex(n int) string {

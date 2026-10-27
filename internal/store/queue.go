@@ -10,7 +10,8 @@ import (
 )
 
 // Claim leases the oldest due message to workerID and moves it to 'sending'.
-// It returns (nil, nil) when nothing is due.
+// Messages for domains in exclude are skipped (the throttle has no room for
+// them right now). It returns (nil, nil) when nothing is claimable.
 //
 // FOR UPDATE SKIP LOCKED lets many workers claim concurrently: each skips rows
 // another transaction has locked instead of waiting on them, so two workers
@@ -18,18 +19,26 @@ import (
 // immediately; we do NOT hold a transaction open across the SMTP session.
 // Ownership during the send is a lease (locked_by + locked_at) instead, which
 // the reaper can break if the worker dies.
-func (s *Store) Claim(ctx context.Context, workerID string, now time.Time) (*Message, error) {
+//
+// The domain filter runs after the index scan, so a large backlog for a
+// blocked domain at the head of the queue is scanned past on every claim.
+// Fine at this scale; a bigger system would shard the queue by domain.
+func (s *Store) Claim(ctx context.Context, workerID string, now time.Time, exclude []string) (*Message, error) {
+	if exclude == nil {
+		exclude = []string{} // NULL would make "<> ALL" exclude every row
+	}
 	row := s.pool.QueryRow(ctx, `
 		UPDATE messages
 		SET state = 'sending', locked_by = $1, locked_at = $2, updated_at = $2
 		WHERE id = (
 			SELECT id FROM messages
 			WHERE state IN ('queued', 'deferred') AND next_attempt_at <= $2
+			  AND domain <> ALL($3::text[])
 			ORDER BY next_attempt_at
 			LIMIT 1
 			FOR UPDATE SKIP LOCKED
 		)
-		RETURNING `+messageCols, workerID, now)
+		RETURNING `+messageCols, workerID, now, exclude)
 	m, err := scanMessage(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil

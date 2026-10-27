@@ -23,6 +23,7 @@ import (
 	"github.com/7vignesh/mailq/internal/smtp"
 	"github.com/7vignesh/mailq/internal/store"
 	"github.com/7vignesh/mailq/internal/testdb"
+	"github.com/7vignesh/mailq/internal/throttle"
 	"github.com/7vignesh/mailq/internal/worker"
 	"github.com/7vignesh/mailq/test/fakesmtp"
 )
@@ -39,9 +40,11 @@ type harness struct {
 }
 
 type workerOpts struct {
-	cfg     worker.Config
-	backoff backoff.Policy
-	client  *smtp.Client
+	cfg      worker.Config
+	backoff  backoff.Policy
+	client   *smtp.Client
+	throttle throttle.Config
+	limiter  *throttle.Limiter // set by startWorker
 }
 
 func newHarness(t *testing.T, fakeOpts fakesmtp.Options) *harness {
@@ -67,15 +70,23 @@ func newHarness(t *testing.T, fakeOpts fakesmtp.Options) *harness {
 	return h
 }
 
-func (h *harness) defaultWorker(id string) workerOpts {
+func (h *harness) defaultWorker(id string) *workerOpts {
 	resolver, dialer := smtp.StaticRoute(h.fake.Addr())
-	return workerOpts{
+	return &workerOpts{
 		cfg: worker.Config{
 			ID: id, Concurrency: 4, PollInterval: 5 * time.Millisecond,
 			AttemptTimeout: 3 * time.Second, Lease: 10 * time.Minute, ReapInterval: 20 * time.Millisecond,
 			HeloName: "mailq.test",
 		},
 		backoff: backoff.Default(),
+		// Generous limits so the throttle stays out of the way unless a
+		// test is about it. The fake clock is frozen, so tokens only
+		// refill when a test advances it.
+		throttle: func() throttle.Config {
+			c := throttle.DefaultConfig()
+			c.MaxConcurrent, c.InitialRate, c.MaxRate, c.Burst = 100, 6000, 6000, 1000
+			return c
+		}(),
 		client: &smtp.Client{
 			HeloName: "mailq.test", Resolver: resolver, Dialer: dialer, Port: "25", StartTLS: true,
 			Timeouts: smtp.Timeouts{Dial: time.Second, Greeting: time.Second, Command: 300 * time.Millisecond,
@@ -86,9 +97,12 @@ func (h *harness) defaultWorker(id string) workerOpts {
 
 // startWorker runs a worker until the test ends and returns a function that
 // stops it and waits for it to exit.
-func (h *harness) startWorker(o workerOpts) (stop func()) {
+func (h *harness) startWorker(o *workerOpts) (stop func()) {
 	h.t.Helper()
-	w, err := worker.New(o.cfg, h.st, o.client, o.backoff, h.clk, h.log)
+	o.limiter = throttle.New(o.throttle, h.clk)
+	w, err := worker.New(o.cfg, worker.Deps{
+		Store: h.st, Client: o.client, Backoff: o.backoff, Limiter: o.limiter, Clock: h.clk, Log: h.log,
+	})
 	if err != nil {
 		h.t.Fatal(err)
 	}
@@ -99,6 +113,13 @@ func (h *harness) startWorker(o workerOpts) (stop func()) {
 	stop = func() { once.Do(func() { cancel(); <-done }) }
 	h.t.Cleanup(stop)
 	return stop
+}
+
+// with returns a copy of h that reports failures to t (for subtests).
+func (h *harness) with(t *testing.T) *harness {
+	c := *h
+	c.t = t
+	return &c
 }
 
 func (h *harness) post(body map[string]string) (int, map[string]any) {

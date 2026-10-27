@@ -105,7 +105,7 @@ func TestClaimSkipLockedNeverDoubleClaims(t *testing.T) {
 			defer wg.Done()
 			id := fmt.Sprintf("w%d", w)
 			for {
-				m, err := s.Claim(ctx, id, t0)
+				m, err := s.Claim(ctx, id, t0, nil)
 				if err != nil {
 					t.Errorf("claim: %v", err)
 					return
@@ -146,7 +146,7 @@ func TestClaimOnlyDueMessages(t *testing.T) {
 	s := testdb.New(t)
 	ctx := context.Background()
 	m, _, _ := s.Enqueue(ctx, newMsg("k"), t0)
-	c, _ := s.Claim(ctx, "w1", t0)
+	c, _ := s.Claim(ctx, "w1", t0, nil)
 	if err := s.Complete(ctx, store.Completion{
 		WorkerID: "w1", MessageID: c.ID, AttemptNumber: 1, StartedAt: t0, FinishedAt: t0,
 		Outcome: "transient", NewState: store.StateDeferred, NextAttemptAt: t0.Add(10 * time.Minute),
@@ -154,10 +154,10 @@ func TestClaimOnlyDueMessages(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got, _ := s.Claim(ctx, "w1", t0.Add(9*time.Minute)); got != nil {
+	if got, _ := s.Claim(ctx, "w1", t0.Add(9*time.Minute), nil); got != nil {
 		t.Fatal("claimed a message before next_attempt_at")
 	}
-	got, err := s.Claim(ctx, "w1", t0.Add(10*time.Minute))
+	got, err := s.Claim(ctx, "w1", t0.Add(10*time.Minute), nil)
 	if err != nil || got == nil || got.ID != m.ID {
 		t.Fatalf("claim at due time = %v, %v; want message %s", got, err, m.ID)
 	}
@@ -170,7 +170,7 @@ func TestReapAndFencing(t *testing.T) {
 	s := testdb.New(t)
 	ctx := context.Background()
 	m, _, _ := s.Enqueue(ctx, newMsg("k"), t0)
-	if _, err := s.Claim(ctx, "w1", t0); err != nil {
+	if _, err := s.Claim(ctx, "w1", t0, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -196,7 +196,7 @@ func TestReapAndFencing(t *testing.T) {
 
 	// w2 picks it up. Then w1 turns out to be alive and tries to report:
 	// its write must not clobber w2's lease.
-	if c, _ := s.Claim(ctx, "w2", later); c == nil {
+	if c, _ := s.Claim(ctx, "w2", later, nil); c == nil {
 		t.Fatal("w2 could not claim reaped message")
 	}
 	err = s.Complete(ctx, store.Completion{
@@ -221,12 +221,12 @@ func TestFencingSurvivesSameWorkerReclaim(t *testing.T) {
 	s := testdb.New(t)
 	ctx := context.Background()
 	m, _, _ := s.Enqueue(ctx, newMsg("k"), t0)
-	first, _ := s.Claim(ctx, "w1", t0)
+	first, _ := s.Claim(ctx, "w1", t0, nil)
 	later := t0.Add(time.Hour)
 	if n, _ := s.Reap(ctx, later, later); n != 1 {
 		t.Fatal("expected reap")
 	}
-	if c, _ := s.Claim(ctx, "w1", later); c == nil {
+	if c, _ := s.Claim(ctx, "w1", later, nil); c == nil {
 		t.Fatal("re-claim failed")
 	}
 	err := s.Complete(ctx, store.Completion{
@@ -245,7 +245,7 @@ func TestReleaseRestoresPreviousState(t *testing.T) {
 	s := testdb.New(t)
 	ctx := context.Background()
 	m, _, _ := s.Enqueue(ctx, newMsg("k"), t0)
-	_, _ = s.Claim(ctx, "w1", t0)
+	_, _ = s.Claim(ctx, "w1", t0, nil)
 	if err := s.Release(ctx, "w1", m.ID, 0, t0.Add(time.Second), t0); err != nil {
 		t.Fatal(err)
 	}
@@ -263,5 +263,25 @@ func TestGetUnknownID(t *testing.T) {
 	_, _, err := s.Get(context.Background(), "00000000-0000-0000-0000-000000000000")
 	if !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestClaimSkipsExcludedDomains(t *testing.T) {
+	s := testdb.New(t)
+	ctx := context.Background()
+	blocked := newMsg("blocked")
+	blocked.Domain = "slow.test"
+	_, _, _ = s.Enqueue(ctx, blocked, t0) // oldest: would be claimed first
+	other, _, _ := s.Enqueue(ctx, newMsg("other"), t0.Add(time.Second))
+
+	got, err := s.Claim(ctx, "w1", t0.Add(time.Minute), []string{"slow.test"})
+	if err != nil || got == nil || got.ID != other.ID {
+		t.Fatalf("claim = %v, %v; want the message for example.com", got, err)
+	}
+	if got, _ := s.Claim(ctx, "w1", t0.Add(time.Minute), []string{"slow.test"}); got != nil {
+		t.Fatalf("claimed %s from an excluded domain", got.Domain)
+	}
+	if got, _ := s.Claim(ctx, "w1", t0.Add(time.Minute), []string{}); got == nil || got.Domain != "slow.test" {
+		t.Fatalf("empty exclude list should claim anything, got %v", got)
 	}
 }
