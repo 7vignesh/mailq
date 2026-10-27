@@ -5,17 +5,21 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/7vignesh/mailq/internal/backoff"
 	"github.com/7vignesh/mailq/internal/clock"
 	"github.com/7vignesh/mailq/internal/env"
+	"github.com/7vignesh/mailq/internal/metrics"
 	"github.com/7vignesh/mailq/internal/smtp"
 	"github.com/7vignesh/mailq/internal/store"
 	"github.com/7vignesh/mailq/internal/throttle"
@@ -49,12 +53,31 @@ func run(log *slog.Logger) error {
 		return err
 	}
 	clk := clock.Real{}
+	reg := metrics.NewRegistry()
+	domains := metrics.DefaultDomains
+	if v := env.String("MAILQ_METRIC_DOMAINS", ""); v != "" {
+		domains = strings.Split(v, ",")
+	}
 	w, err := worker.New(cfg, worker.Deps{
-		Store: st, Client: client, Backoff: bo, Limiter: throttle.New(tc, clk), Clock: clk, Log: log,
+		Store: st, Client: client, Backoff: bo, Limiter: throttle.New(tc, clk),
+		Metrics: metrics.NewWorker(reg, domains), Clock: clk, Log: log,
 	})
 	if err != nil {
 		return err
 	}
+
+	// /metrics on its own listener. Prometheus scrapes the API and every
+	// worker process separately.
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", metrics.Handler(reg))
+	msrv := &http.Server{Addr: env.String("MAILQ_METRICS_ADDR", "127.0.0.1:9091"), Handler: mux,
+		ReadHeaderTimeout: 10 * time.Second}
+	go func() {
+		if err := msrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error("metrics server", "err", err)
+		}
+	}()
+	defer msrv.Close()
 	log.Info("starting", "worker_id", cfg.ID, "concurrency", cfg.Concurrency)
 	w.Run(ctx)
 	log.Info("stopped")

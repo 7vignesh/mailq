@@ -13,6 +13,7 @@ import (
 	"github.com/7vignesh/mailq/internal/backoff"
 	"github.com/7vignesh/mailq/internal/classifier"
 	"github.com/7vignesh/mailq/internal/clock"
+	"github.com/7vignesh/mailq/internal/metrics"
 	"github.com/7vignesh/mailq/internal/smtp"
 	"github.com/7vignesh/mailq/internal/store"
 	"github.com/7vignesh/mailq/internal/throttle"
@@ -49,6 +50,7 @@ type Worker struct {
 	client  *smtp.Client
 	backoff backoff.Policy
 	limiter *throttle.Limiter
+	metrics *metrics.Worker
 	clock   clock.Clock
 	log     *slog.Logger
 }
@@ -58,6 +60,7 @@ type Deps struct {
 	Client  *smtp.Client
 	Backoff backoff.Policy
 	Limiter *throttle.Limiter
+	Metrics *metrics.Worker
 	Clock   clock.Clock
 	Log     *slog.Logger
 }
@@ -70,7 +73,7 @@ func New(cfg Config, d Deps) (*Worker, error) {
 		return nil, err
 	}
 	return &Worker{cfg: cfg, store: d.Store, client: d.Client, backoff: d.Backoff, limiter: d.Limiter,
-		clock: d.Clock, log: d.Log.With("worker_id", cfg.ID)}, nil
+		metrics: d.Metrics, clock: d.Clock, log: d.Log.With("worker_id", cfg.ID)}, nil
 }
 
 // Run delivers until ctx is canceled, then waits for in-flight attempts.
@@ -109,6 +112,7 @@ func (w *Worker) deliverLoop(ctx context.Context) {
 		if permit == nil {
 			// Lost a race with another goroutine for the domain's last slot.
 			// Hand the message back without counting an attempt.
+			w.metrics.ThrottleReleases.WithLabelValues(w.metrics.Domains.Label(m.Domain)).Inc()
 			w.release(m, wait)
 			continue
 		}
@@ -147,19 +151,28 @@ func (w *Worker) attempt(ctx context.Context, m *store.Message, permit *throttle
 
 	actx, cancel := context.WithTimeout(ctx, w.cfg.AttemptTimeout)
 	defer cancel()
-	started := w.clock.Now()
+	w.metrics.InFlight.Inc()
+	started, t := w.clock.Now(), time.Now() // queue clock for records, monotonic clock for latency
 	res := w.client.Send(actx, smtp.Envelope{
 		From: m.From,
 		To:   m.To,
 		Data: smtp.BuildMessage(m.ID, m.From, m.To, m.Subject, m.Body, w.cfg.HeloName, m.CreatedAt),
 	})
+	elapsed := time.Since(t)
 	finished := w.clock.Now()
+	w.metrics.InFlight.Dec()
 
 	cls := classifier.Classify(classifier.Input{
 		Code: res.Code, Enhanced: res.Enhanced, Text: res.Text,
 		Stage: string(res.Stage), Transport: string(res.ErrKind),
 	})
-	permit.Done(signal(cls))
+	domain := w.metrics.Domains.Label(m.Domain)
+	if permit.Done(signal(cls)) {
+		w.metrics.ThrottleDecreases.WithLabelValues(domain).Inc()
+		st, _ := w.limiter.Stats(m.Domain)
+		log.Warn("throttle signal: domain rate cut", "rate_per_min", st.Rate, "smtp_code", res.Code,
+			"enhanced_code", res.Enhanced)
+	}
 	newState, next := w.decide(m, n, cls, finished)
 
 	c := store.Completion{
@@ -177,23 +190,41 @@ func (w *Worker) attempt(ctx context.Context, m *store.Message, permit *throttle
 
 	log = log.With("mx_host", res.MXHost, "outcome", cls.Outcome, "reason", cls.Reason,
 		"smtp_code", res.Code, "enhanced_code", res.Enhanced, "stage", res.Stage,
-		"rule", cls.Rule, "state", newState, "duration_ms", finished.Sub(started).Milliseconds())
+		"rule", cls.Rule, "state", newState, "duration_ms", elapsed.Milliseconds())
 	if res.Err != nil {
 		log = log.With("err", res.Err)
 	}
 	switch {
 	case errors.Is(err, store.ErrLeaseLost):
+		w.metrics.LeaseLost.Inc()
 		log.Warn("lease lost before result was recorded; another worker owns the message")
+		return
 	case err != nil:
 		// The message stays 'sending' until its lease expires and the
 		// reaper retries it. If this attempt was delivered, that retry
 		// is a duplicate.
 		log.Error("failed to record attempt", "err", err)
+		return
 	case newState == store.StateDeferred:
 		log.Info("attempt deferred", "next_attempt_at", next)
 	default:
 		log.Info("attempt finished")
 	}
+	w.observe(m, n, domain, cls, newState, elapsed, finished)
+}
+
+// observe updates metrics once an attempt's result is safely recorded.
+func (w *Worker) observe(m *store.Message, n int, domain string, cls classifier.Result,
+	st store.State, elapsed time.Duration, now time.Time) {
+	w.metrics.Attempts.WithLabelValues(domain, string(cls.Outcome), string(cls.Reason)).Inc()
+	w.metrics.AttemptDuration.WithLabelValues(string(cls.Outcome)).Observe(elapsed.Seconds())
+	if st == store.StateDeferred {
+		w.metrics.Retries.WithLabelValues(domain, string(cls.Reason)).Inc()
+		return
+	}
+	w.metrics.Finished.WithLabelValues(domain, string(st)).Inc()
+	w.metrics.TimeToFinal.WithLabelValues(string(st)).Observe(now.Sub(m.CreatedAt).Seconds())
+	w.metrics.AttemptsToFinal.WithLabelValues(string(st)).Observe(float64(n))
 }
 
 // decide maps a classification to the message's next state.
@@ -222,6 +253,7 @@ func (w *Worker) reapLoop(ctx context.Context) {
 		case err != nil && ctx.Err() == nil:
 			w.log.Error("reap failed", "err", err)
 		case n > 0:
+			w.metrics.Reaped.Add(float64(n))
 			w.log.Warn("reaped expired leases", "count", n)
 		}
 		w.limiter.Sweep()

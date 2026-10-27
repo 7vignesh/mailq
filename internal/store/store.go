@@ -200,6 +200,17 @@ func (s *Store) CountByState(ctx context.Context) (map[State]int, error) {
 	return counts, rows.Err()
 }
 
+// CountByStateString is CountByState keyed by plain strings, for the
+// metrics package.
+func (s *Store) CountByStateString(ctx context.Context) (map[string]int, error) {
+	c, err := s.CountByState(ctx)
+	out := make(map[string]int, len(c))
+	for k, v := range c {
+		out[string(k)] = v
+	}
+	return out, err
+}
+
 func scanMessage(row pgx.Row) (Message, error) {
 	var m Message
 	err := row.Scan(&m.ID, &m.IdempotencyKey, &m.payloadHash, &m.From, &m.To, &m.Domain, &m.Subject, &m.Body,

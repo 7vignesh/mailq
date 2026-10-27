@@ -14,6 +14,7 @@ import (
 	"github.com/7vignesh/mailq/internal/api"
 	"github.com/7vignesh/mailq/internal/clock"
 	"github.com/7vignesh/mailq/internal/env"
+	"github.com/7vignesh/mailq/internal/metrics"
 	"github.com/7vignesh/mailq/internal/store"
 )
 
@@ -41,9 +42,14 @@ func run(log *slog.Logger) error {
 		return err
 	}
 
+	reg := metrics.NewRegistry()
+	reg.MustRegister(metrics.NewQueueDepth(st))
+	mux := api.New(st, clock.Real{}, log, metrics.NewAPI(reg)).Routes()
+	mux.Handle("GET /metrics", metrics.Handler(reg))
+
 	srv := &http.Server{
 		Addr:              env.String("MAILQ_API_ADDR", "127.0.0.1:8080"),
-		Handler:           api.New(st, clock.Real{}, log).Routes(),
+		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,

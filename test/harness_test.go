@@ -20,12 +20,14 @@ import (
 	"github.com/7vignesh/mailq/internal/api"
 	"github.com/7vignesh/mailq/internal/backoff"
 	"github.com/7vignesh/mailq/internal/clock"
+	"github.com/7vignesh/mailq/internal/metrics"
 	"github.com/7vignesh/mailq/internal/smtp"
 	"github.com/7vignesh/mailq/internal/store"
 	"github.com/7vignesh/mailq/internal/testdb"
 	"github.com/7vignesh/mailq/internal/throttle"
 	"github.com/7vignesh/mailq/internal/worker"
 	"github.com/7vignesh/mailq/test/fakesmtp"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 var t0 = time.Date(2026, 3, 1, 9, 0, 0, 0, time.UTC)
@@ -44,7 +46,9 @@ type workerOpts struct {
 	backoff  backoff.Policy
 	client   *smtp.Client
 	throttle throttle.Config
+	domains  []string          // metric domain allowlist
 	limiter  *throttle.Limiter // set by startWorker
+	metrics  *metrics.Worker   // set by startWorker
 }
 
 func newHarness(t *testing.T, fakeOpts fakesmtp.Options) *harness {
@@ -65,7 +69,11 @@ func newHarness(t *testing.T, fakeOpts fakesmtp.Options) *harness {
 
 	h := &harness{t: t, st: st, fake: fake, clk: clock.NewFake(t0),
 		log: slog.New(slog.NewTextHandler(testWriter{t}, &slog.HandlerOptions{Level: slog.LevelWarn}))}
-	h.api = httptest.NewServer(api.New(st, h.clk, h.log).Routes())
+	reg := metrics.NewRegistry()
+	reg.MustRegister(metrics.NewQueueDepth(st))
+	mux := api.New(st, h.clk, h.log, metrics.NewAPI(reg)).Routes()
+	mux.Handle("GET /metrics", metrics.Handler(reg))
+	h.api = httptest.NewServer(mux)
 	t.Cleanup(h.api.Close)
 	return h
 }
@@ -100,8 +108,10 @@ func (h *harness) defaultWorker(id string) *workerOpts {
 func (h *harness) startWorker(o *workerOpts) (stop func()) {
 	h.t.Helper()
 	o.limiter = throttle.New(o.throttle, h.clk)
+	o.metrics = metrics.NewWorker(prometheus.NewRegistry(), o.domains)
 	w, err := worker.New(o.cfg, worker.Deps{
-		Store: h.st, Client: o.client, Backoff: o.backoff, Limiter: o.limiter, Clock: h.clk, Log: h.log,
+		Store: h.st, Client: o.client, Backoff: o.backoff, Limiter: o.limiter, Metrics: o.metrics,
+		Clock: h.clk, Log: h.log,
 	})
 	if err != nil {
 		h.t.Fatal(err)

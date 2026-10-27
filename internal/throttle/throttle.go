@@ -122,12 +122,14 @@ func (l *Limiter) TryAcquire(domain string) (*Permit, time.Duration) {
 	return &Permit{l: l, domain: domain}, 0
 }
 
-// Done releases the slot and feeds the attempt's signal into AIMD.
-func (p *Permit) Done(s Signal) {
-	p.once.Do(func() { p.l.done(p.domain, s) })
+// Done releases the slot and feeds the attempt's signal into AIMD. It
+// reports whether this call cut the domain's rate.
+func (p *Permit) Done(s Signal) (decreased bool) {
+	p.once.Do(func() { decreased = p.l.done(p.domain, s) })
+	return decreased
 }
 
-func (l *Limiter) done(domain string, s Signal) {
+func (l *Limiter) done(domain string, s Signal) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.clock.Now()
@@ -140,21 +142,22 @@ func (l *Limiter) done(domain string, s Signal) {
 		// connections hitting the same 421 at once is one signal, not five,
 		// and should halve the rate once, not divide it by 32.
 		if now.Sub(b.lastDecrease) < l.cfg.DecreaseCooldown {
-			return
+			return false
 		}
 		b.rate = max(l.cfg.MinRate, b.rate*l.cfg.DecreaseFactor)
 		b.tokens = min(b.tokens, 0) // stop sending now, not after the burst drains
 		b.lastDecrease, b.lastIncrease = now, now
 		b.decreases++
+		return true
 	case Success:
 		// Additive in time, not per message: per-message increases would
 		// grow the rate in proportion to itself, which is exponential.
-		if now.Sub(b.lastIncrease) < l.cfg.IncreaseInterval {
-			return
+		if now.Sub(b.lastIncrease) >= l.cfg.IncreaseInterval {
+			b.rate = min(l.cfg.MaxRate, b.rate+l.cfg.IncreaseStep)
+			b.lastIncrease = now
 		}
-		b.rate = min(l.cfg.MaxRate, b.rate+l.cfg.IncreaseStep)
-		b.lastIncrease = now
 	}
+	return false
 }
 
 // Blocked lists domains that cannot take a delivery right now, so the

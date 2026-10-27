@@ -9,19 +9,21 @@ import (
 	"regexp"
 
 	"github.com/7vignesh/mailq/internal/clock"
+	"github.com/7vignesh/mailq/internal/metrics"
 	"github.com/7vignesh/mailq/internal/store"
 )
 
 const maxBodyBytes = 1 << 20 // 1 MiB request limit, including the message body
 
 type Server struct {
-	store *store.Store
-	clock clock.Clock
-	log   *slog.Logger
+	store   *store.Store
+	clock   clock.Clock
+	log     *slog.Logger
+	metrics *metrics.API
 }
 
-func New(st *store.Store, clk clock.Clock, log *slog.Logger) *Server {
-	return &Server{store: st, clock: clk, log: log}
+func New(st *store.Store, clk clock.Clock, log *slog.Logger, m *metrics.API) *Server {
+	return &Server{store: st, clock: clk, log: log, metrics: m}
 }
 
 func (s *Server) Routes() *http.ServeMux {
@@ -49,11 +51,13 @@ func (s *Server) postMessage(w http.ResponseWriter, r *http.Request) {
 	dec.DisallowUnknownFields()
 	var req postRequest
 	if err := dec.Decode(&req); err != nil {
+		s.metrics.Ingest.WithLabelValues("invalid").Inc()
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
 	nm, err := validate(req)
 	if err != nil {
+		s.metrics.Ingest.WithLabelValues("invalid").Inc()
 		writeError(w, http.StatusUnprocessableEntity, err.Error())
 		return
 	}
@@ -61,10 +65,12 @@ func (s *Server) postMessage(w http.ResponseWriter, r *http.Request) {
 	m, created, err := s.store.Enqueue(r.Context(), nm, s.clock.Now())
 	switch {
 	case errors.Is(err, store.ErrIdempotencyConflict):
+		s.metrics.Ingest.WithLabelValues("conflict").Inc()
 		writeJSON(w, http.StatusConflict, map[string]any{
 			"error": "idempotency_key was already used with a different payload", "message": summary(m)})
 		return
 	case err != nil:
+		s.metrics.Ingest.WithLabelValues("error").Inc()
 		s.log.Error("enqueue failed", "err", err)
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return
@@ -72,7 +78,10 @@ func (s *Server) postMessage(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusOK
 	if created {
 		status = http.StatusAccepted
+		s.metrics.Ingest.WithLabelValues("created").Inc()
 		s.log.Info("message accepted", "message_id", m.ID, "domain", m.Domain)
+	} else {
+		s.metrics.Ingest.WithLabelValues("duplicate").Inc()
 	}
 	writeJSON(w, status, summary(m))
 }
