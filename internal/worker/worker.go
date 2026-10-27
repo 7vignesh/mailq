@@ -26,6 +26,7 @@ type Config struct {
 	AttemptTimeout time.Duration // hard deadline for one attempt, all MX hosts included
 	Lease          time.Duration // a lease older than this is presumed dead and reaped
 	ReapInterval   time.Duration
+	ShutdownGrace  time.Duration // how long in-flight attempts may run after shutdown starts
 	HeloName       string
 }
 
@@ -76,8 +77,36 @@ func New(cfg Config, d Deps) (*Worker, error) {
 		metrics: d.Metrics, clock: d.Clock, log: d.Log.With("worker_id", cfg.ID)}, nil
 }
 
-// Run delivers until ctx is canceled, then waits for in-flight attempts.
+// Run delivers until ctx is canceled, then shuts down in two phases:
+//
+//  1. Stop claiming immediately. In-flight attempts keep running.
+//  2. After ShutdownGrace, cancel whatever is still running. Those
+//     attempts are recorded as interrupted and deferred, due immediately.
+//
+// Run returns once every attempt has been recorded. A message is never
+// left in 'sending' by a clean shutdown; only a crash (or a failed database
+// write) leaves a lease for the reaper.
 func (w *Worker) Run(ctx context.Context) {
+	sendCtx, cancelSend := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelSend()
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-done:
+			return
+		case <-ctx.Done():
+		}
+		w.log.Info("shutdown: stopped claiming, draining in-flight attempts", "grace", w.cfg.ShutdownGrace)
+		t := time.NewTimer(w.cfg.ShutdownGrace)
+		defer t.Stop()
+		select {
+		case <-done:
+		case <-t.C:
+			w.log.Warn("shutdown: grace period over, interrupting in-flight attempts")
+			cancelSend()
+		}
+	}()
+
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -88,19 +117,27 @@ func (w *Worker) Run(ctx context.Context) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			w.deliverLoop(ctx)
+			w.deliverLoop(ctx, sendCtx)
 		}()
 	}
 	wg.Wait()
+	close(done)
 }
 
-func (w *Worker) deliverLoop(ctx context.Context) {
+// claimCtx bounds a claim without tying it to shutdown. Canceling a claim
+// mid-query could commit the UPDATE while we never see the row, leaving a
+// lease only the reaper can clear.
+func claimCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), 10*time.Second)
+}
+
+func (w *Worker) deliverLoop(ctx, sendCtx context.Context) {
 	for ctx.Err() == nil {
-		m, err := w.store.Claim(ctx, w.cfg.ID, w.clock.Now(), w.limiter.Blocked())
+		cctx, cancel := claimCtx()
+		m, err := w.store.Claim(cctx, w.cfg.ID, w.clock.Now(), w.limiter.Blocked())
+		cancel()
 		if err != nil {
-			if ctx.Err() == nil {
-				w.log.Error("claim failed", "err", err)
-			}
+			w.log.Error("claim failed", "err", err)
 			sleep(ctx, w.cfg.PollInterval)
 			continue
 		}
@@ -116,7 +153,7 @@ func (w *Worker) deliverLoop(ctx context.Context) {
 			w.release(m, wait)
 			continue
 		}
-		w.attempt(ctx, m, permit)
+		w.attempt(sendCtx, m, permit)
 	}
 }
 

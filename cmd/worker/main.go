@@ -104,7 +104,11 @@ func load() (worker.Config, *smtp.Client, backoff.Policy, throttle.Config, error
 		AttemptTimeout: dur("MAILQ_ATTEMPT_TIMEOUT", 15*time.Minute),
 		Lease:          dur("MAILQ_LEASE", 20*time.Minute),
 		ReapInterval:   dur("MAILQ_REAP_INTERVAL", 30*time.Second),
-		HeloName:       helo,
+		// Keep this below the supervisor's kill timeout (Docker and
+		// Kubernetes default to 10s and 30s), or SIGKILL arrives first and
+		// in-flight leases are left for the reaper.
+		ShutdownGrace: dur("MAILQ_SHUTDOWN_GRACE", 20*time.Second),
+		HeloName:      helo,
 	}
 
 	t := smtp.DefaultTimeouts()

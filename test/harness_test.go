@@ -84,7 +84,7 @@ func (h *harness) defaultWorker(id string) *workerOpts {
 		cfg: worker.Config{
 			ID: id, Concurrency: 4, PollInterval: 5 * time.Millisecond,
 			AttemptTimeout: 3 * time.Second, Lease: 10 * time.Minute, ReapInterval: 20 * time.Millisecond,
-			HeloName: "mailq.test",
+			ShutdownGrace: 5 * time.Second, HeloName: "mailq.test",
 		},
 		backoff: backoff.Default(),
 		// Generous limits so the throttle stays out of the way unless a
