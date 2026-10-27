@@ -42,13 +42,14 @@ func (s *Store) Claim(ctx context.Context, workerID string, now time.Time) (*Mes
 
 // Release gives a claimed message back without counting an attempt, e.g.
 // when the per-domain throttle says "not yet". It becomes claimable at 'at'.
-func (s *Store) Release(ctx context.Context, workerID, id string, at, now time.Time) error {
+// attemptCount is the value the claim returned; see Complete for fencing.
+func (s *Store) Release(ctx context.Context, workerID, id string, attemptCount int, at, now time.Time) error {
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE messages
 		SET state = CASE WHEN attempt_count = 0 THEN 'queued' ELSE 'deferred' END,
-		    next_attempt_at = $3, locked_by = NULL, locked_at = NULL, updated_at = $4
-		WHERE id = $1::uuid AND state = 'sending' AND locked_by = $2`,
-		id, workerID, at, now)
+		    next_attempt_at = $4, locked_by = NULL, locked_at = NULL, updated_at = $5
+		WHERE id = $1::uuid AND state = 'sending' AND locked_by = $2 AND attempt_count = $3`,
+		id, workerID, attemptCount, at, now)
 	if err != nil {
 		return fmt.Errorf("store: release: %w", err)
 	}
@@ -81,10 +82,11 @@ type Completion struct {
 // Complete records the attempt and moves the message out of 'sending' in one
 // transaction.
 //
-// The state update is fenced on locked_by: if the reaper already handed the
-// message to another worker, the update matches no row and ErrLeaseLost is
-// returned. The attempt row is still committed, because the attempt really
-// happened and the history should show it.
+// The state update is fenced on (locked_by, attempt_count). The reaper
+// increments attempt_count, so if it already broke this lease the update
+// matches no row, even if the same worker re-claimed the message since,
+// and ErrLeaseLost is returned. The attempt row is still committed, because
+// the attempt really happened and the history should show it.
 func (s *Store) Complete(ctx context.Context, c Completion) error {
 	switch c.NewState {
 	case StateDeferred, StateDelivered, StateBounced, StateFailed:
@@ -111,8 +113,8 @@ func (s *Store) Complete(ctx context.Context, c Completion) error {
 			UPDATE messages
 			SET state = $3, attempt_count = attempt_count + 1, next_attempt_at = $4,
 			    locked_by = NULL, locked_at = NULL, updated_at = $5
-			WHERE id = $1::uuid AND state = 'sending' AND locked_by = $2`,
-			c.MessageID, c.WorkerID, c.NewState, next, c.FinishedAt)
+			WHERE id = $1::uuid AND state = 'sending' AND locked_by = $2 AND attempt_count = $6`,
+			c.MessageID, c.WorkerID, c.NewState, next, c.FinishedAt, c.AttemptNumber-1)
 		if err != nil {
 			return err
 		}

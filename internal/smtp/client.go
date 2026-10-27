@@ -62,13 +62,6 @@ func DefaultTimeouts() Timeouts {
 		DataWrite: 3 * time.Minute, DataEnd: 10 * time.Minute}
 }
 
-// Total is the worst case for one host. Leases must be longer than the
-// attempt deadline, which must cover the hosts the client will try.
-func (t Timeouts) Total() time.Duration {
-	// greeting + EHLO + STARTTLS + handshake + EHLO + MAIL + RCPT + DATA + QUIT
-	return t.Dial + t.Greeting + 8*t.Command + t.DataWrite + t.DataEnd
-}
-
 type Resolver interface {
 	LookupMX(ctx context.Context, name string) ([]*net.MX, error)
 	LookupHost(ctx context.Context, host string) ([]string, error)

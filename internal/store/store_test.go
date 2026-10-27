@@ -215,19 +215,45 @@ func TestReapAndFencing(t *testing.T) {
 	}
 }
 
+// Same worker id, two leases: a result for the reaped lease must not land
+// on the newer one.
+func TestFencingSurvivesSameWorkerReclaim(t *testing.T) {
+	s := testdb.New(t)
+	ctx := context.Background()
+	m, _, _ := s.Enqueue(ctx, newMsg("k"), t0)
+	first, _ := s.Claim(ctx, "w1", t0)
+	later := t0.Add(time.Hour)
+	if n, _ := s.Reap(ctx, later, later); n != 1 {
+		t.Fatal("expected reap")
+	}
+	if c, _ := s.Claim(ctx, "w1", later); c == nil {
+		t.Fatal("re-claim failed")
+	}
+	err := s.Complete(ctx, store.Completion{
+		WorkerID: "w1", MessageID: m.ID, AttemptNumber: first.AttemptCount + 1,
+		StartedAt: t0, FinishedAt: later, Outcome: "delivered", NewState: store.StateDelivered,
+	})
+	if !errors.Is(err, store.ErrLeaseLost) {
+		t.Fatalf("err = %v, want ErrLeaseLost", err)
+	}
+	if err := s.Release(ctx, "w1", m.ID, first.AttemptCount, later, later); !errors.Is(err, store.ErrLeaseLost) {
+		t.Fatalf("release with stale attempt count: err = %v, want ErrLeaseLost", err)
+	}
+}
+
 func TestReleaseRestoresPreviousState(t *testing.T) {
 	s := testdb.New(t)
 	ctx := context.Background()
 	m, _, _ := s.Enqueue(ctx, newMsg("k"), t0)
 	_, _ = s.Claim(ctx, "w1", t0)
-	if err := s.Release(ctx, "w1", m.ID, t0.Add(time.Second), t0); err != nil {
+	if err := s.Release(ctx, "w1", m.ID, 0, t0.Add(time.Second), t0); err != nil {
 		t.Fatal(err)
 	}
 	got, _, _ := s.Get(ctx, m.ID)
 	if got.State != store.StateQueued || got.AttemptCount != 0 {
 		t.Fatalf("after release: state=%s attempts=%d, want queued/0", got.State, got.AttemptCount)
 	}
-	if err := s.Release(ctx, "w1", m.ID, t0, t0); !errors.Is(err, store.ErrLeaseLost) {
+	if err := s.Release(ctx, "w1", m.ID, 0, t0, t0); !errors.Is(err, store.ErrLeaseLost) {
 		t.Fatalf("double release err = %v, want ErrLeaseLost", err)
 	}
 }
