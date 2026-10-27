@@ -1,0 +1,18 @@
+# Binaries
+/bin/
+*.exe
+*.test
+*.out
+
+# Local config and secrets: never commit these
+.env
+.env.*
+*.local
+*.pem
+*.key
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
