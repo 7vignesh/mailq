@@ -506,17 +506,34 @@ and start another worker.
 Many home and cloud networks block outbound port 25, so real delivery may
 need a VPS whose provider allows it. On 2026-10-28, my home network did
 **not** block it: a TCP connection to `gmail-smtp-in.l.google.com:25` got a
-`220 mx.google.com ESMTP` banner.
+`220 mx.google.com ESMTP` banner, and the real send below reached Gmail's
+MX and got a reply from it.
 
 To try one real send to your own address, run the worker *without*
 `MAILQ_STATIC_ROUTE`, set `MAILQ_HELO_NAME` to a name you control, and
 POST a message to your Gmail or Outlook address. A residential IP with no
 matching PTR record, SPF or DKIM is likely to be rejected or spam-foldered.
 That is still a useful result: the reply codes and texts show how the
-classifier handles a real provider. I haven't run this yet.
+classifier handles a real provider.
 
-Result: _TODO (author): MX host, reply code, enhanced code and text, and how
-the classifier labeled it._
+Result (2026-10-28, sending to my own Gmail from a home IPv6 address, HELO
+name = my machine's hostname, no PTR/SPF/DKIM):
+
+- MX host: `gmail-smtp-in.l.google.com` (resolved via a real `LookupMX`)
+- Reply: `550 5.7.1` at end of DATA
+- Text: "The IP you're using to send mail is not authorized to send email
+  directly to our servers. Please use the SMTP relay at your service
+  provider instead." (`NotAuthorizedError`)
+- Classifier: **permanent / policy_blocked**, rule "5xx"
+
+Gmail accepted the TCP connection, the EHLO and the whole message, then
+rejected it at the final `.` because an unauthenticated residential IP is
+not allowed to deliver directly. So the SMTP pipeline worked end to end
+against real MX on port 25; the bounce is about sender authorization, which
+is exactly what DKIM, SPF and a proper relay (all out of scope here) exist
+to satisfy. A nice bonus: a stale `example.net` message from an earlier
+demo hit a real null MX (RFC 7505) and bounced as `bad_domain`, which
+exercised that DNS path against live records too.
 
 ## Unverified assumptions
 
